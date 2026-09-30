@@ -34,8 +34,13 @@ Spec: muse-os delegation dlg_5b0098f1 instruction seq 2 (A2A bridge v1 build spe
       user bus; documents VM-replacement recovery = re-run install.sh).
 - [x] README.md: metric/measure/cadence/kill, auth design, approval preservation.
 
-## To verify after push (production)
-- Deployment READY; card shows runtime-task skill.
-- 401 on unauthenticated/wrong-token bridge calls.
-- SDK submit `/run http-get <card url>` -> poller claims -> COMPLETED with real card JSON.
-- SDK submit `/run <non-registry>` -> FAILED with refusal text.
+## Verified in production (2026-09-30 ~12:15 CDT) — 5/5 PASS
+- 401 on unauthenticated/wrong-token/malformed bridge calls (wrong-length
+  token 500'd in timingSafeEqual — fixed by padding buffers, ccaff78).
+- SDK `/run http-get <card url>` -> poller claimed/executed/committed;
+  GetTask COMPLETED with REAL card JSON (6 skills, org johnnyc).
+- SDK `/run do something consequential` -> FAILED with refusal text.
+- SDK `/run vercel-read list_projects {}` -> COMPLETED with real data.
+- Poller daemon running (~/workspace/a2a-bridge, pid via install.sh);
+  complete retries 409/410 with backoff (blob read-after-write window).
+- Full proof in VERIFICATION.md "Bridge v1 addendum". Ready for Editor review.
