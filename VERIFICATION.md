@@ -231,3 +231,37 @@ just-overwritten task for a second or two (claim-then-complete 409'd once;
 GetTask briefly showed WORKING after a 200 complete). The VM poller retries
 complete on 409/410 with backoff (immediate/+3s/+8s); consistent on re-read
 within ~1-2 min. No data loss observed — the retry is the v1 answer.
+
+## Bridge v1 root-cause correction — 2026-09-30 ~12:35 CDT
+
+Two further defects found during the live self-test, both fixed and
+re-verified in production:
+
+1. **Stale task reads (root cause):** `@vercel/blob` `get()` defaults to
+   `useCache: true` — the CDN cache served pre-claim / pre-complete task
+   copies for MINUTES after overwrites. Symptoms: `complete` 409'd
+   `not-claimed` on a just-claimed task (3x over 12s); `GetTask` showed
+   WORKING ~100s after a 200 complete. The task store is read-after-write
+   by design (claim -> complete -> GetTask), so reads now use
+   `get(pathname, { access: 'private', useCache: false })` (commit
+   `5822b44`). Defense in depth kept: `complete` waits up to 20s for a
+   claim to become visible before 409ing (`readForComplete`); the poller
+   retries complete on 409/410 with backoff.
+2. **Dead lease-expiry path:** claims move tasks to WORKING, but the lazy
+   lease release only handled SUBMITTED tasks — a claim whose complete
+   never landed sat WORKING forever, never re-claimable. `leaseReleasable()`
+   (commit `58130f0`) now covers any non-terminal held claim with a past
+   lease: `pending` lazily resets it to SUBMITTED/unclaimed and `claim`
+   accepts it. Terminal states are never re-claimed.
+
+**Final live proof (2026-09-30 ~12:35 CDT), real SDK vs production:**
+fresh `/run http-get <card url>` -> WORKING in the sendMessage response ->
+poller claimed, executed, committed in ~35s end-to-end -> GetTask
+TASK_STATE_COMPLETED with the REAL card JSON (org johnnyc, 6 skills incl.
+runtime-task), reads fresh immediately. Claim->complete 2s apart, first
+attempt, no retries needed. Production deployment `dpl_FmunJYA14Yw6tFPdzM1D2KnaJ5X6`
+(commit `5822b44`) READY.
+
+Also validated: VM restart mid-test killed the poller daemon; recovery is
+exactly `~/workspace/a2a-bridge/install.sh` (re-ran, daemon back, no state
+lost — tasks persist in blob).
