@@ -168,3 +168,34 @@ ephemeral tasks.
   only enum casing and the response wrapper differ from v1.0.
 - `TaskStore` abstraction with KV/memory fallback is the right design — it just
   isn't configured in production.
+
+## Production addendum — 2026-09-30 ~11:45 CDT
+
+Round-2 re-verification of `e5bd62e` (different agent from implementer):
+**9/9 PASS** with real `@a2a-js/sdk@1.3.0` against a local prod build —
+card-driven `createFromUrl`, `sendMessage` (TASK_STATE_COMPLETED, echo
+correct), `getTask`, `sendMessageStream` (non-empty
+`statusUpdate`/`artifactUpdate` oneofs), typed `-32002`/`-32001` errors,
+raw SSE JSON-RPC envelopes with matching ids. Both round-1 wire defects
+genuinely fixed.
+
+**Production defect found during the live proof (fixed in `1e70d51`):**
+the first production deploy served the card correctly but every
+`SendMessage` returned `-32603`. Root cause: the Blob task store used
+`put(..., { access: 'public' })` against the *private* `a2a-task-store` —
+the Blob API rejects public blobs in a private store — and reads used
+unauthenticated `fetch(downloadUrl)`, which cannot work for private
+blobs. `access` is per-blob, never inferred from the store. Fix: bumped
+`@vercel/blob` 1.x → 2.8.0 (private storage needs >= 2.3),
+`put(..., { access: 'private' })`, reads via
+`get(pathname, { access: 'private' })` stream. Typecheck + build clean.
+
+**Live production proof (2026-09-30 ~11:50 CDT), real SDK vs
+https://a2a-agent-server-johnnyc.vercel.app — 9/9 PASS**, plus:
+- Cross-process `getTask` (separate process, new task id) → PASS —
+  tasks persist in the Blob store across serverless instances.
+- `/server-info` skill reports `store: blob` → PASS.
+
+GitHub → Vercel git deploys confirmed working: push to `master`
+auto-built production deployment `dpl_CSzEVBrDVK2oyH1H1LrQxshSL1dh`
+(READY, commit `1e70d51`).
