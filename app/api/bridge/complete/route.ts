@@ -13,7 +13,8 @@ export const dynamic = 'force-dynamic';
  * VM poller commits a result: { taskId, text, artifacts?, state? }.
  * state defaults to TASK_STATE_COMPLETED; the poller may commit
  * TASK_STATE_FAILED (e.g. a refused non-registry instruction) — terminal
- * states only. Fails 409 when not claimed, 410 when the lease expired.
+ * states only. Fails 409 when not claimed, 409 when already completed
+ * (committed results are never overwritten), 410 when the lease expired.
  */
 export async function POST(req: NextRequest) {
   try {
