@@ -611,6 +611,15 @@ export interface BridgeMeta {
 
 export const BRIDGE_LEASE_MS = 5 * 60 * 1000;
 
+/** Max instruction text accepted by /run (2 KB) — larger is rejected. */
+export const BRIDGE_MAX_INSTRUCTION_CHARS = 2048;
+/**
+ * Max unclaimed bridge tasks before /run submissions are rate-limited.
+ * Guards the public intake against queue flooding; the poller drains at its
+ * own pace and /run stays public and unauthenticated.
+ */
+export const BRIDGE_MAX_UNCLAIMED = 50;
+
 /** REST error carrying an HTTP status for the bridge routes. */
 export class BridgeError extends Error {
   status: number;
@@ -703,6 +712,23 @@ export async function submitRuntimeTask(
   }
   if (!instruction) {
     throw new RpcError(-32602, '"/run" requires an instruction after it');
+  }
+  // P2-3a: bound instruction size on the public intake.
+  if (instruction.length > BRIDGE_MAX_INSTRUCTION_CHARS) {
+    throw new RpcError(
+      -32602,
+      `"/run" instruction exceeds ${BRIDGE_MAX_INSTRUCTION_CHARS} characters (got ${instruction.length})`,
+    );
+  }
+  // P2-3b: queue-depth guard. JSON-RPC has no 429 status, so the rejection
+  // rides as a server error (-32000) with an explicit rate-limit message.
+  // listBridgePending also lazily releases expired leases (benign here).
+  const unclaimed = await listBridgePending();
+  if (unclaimed.length >= BRIDGE_MAX_UNCLAIMED) {
+    throw new RpcError(
+      -32000,
+      `bridge queue full: ${BRIDGE_MAX_UNCLAIMED} unclaimed tasks awaiting the poller; retry later`,
+    );
   }
   const store = await getStore();
   const taskId = crypto.randomUUID();
@@ -871,6 +897,11 @@ export async function completeBridgeTask(
   const task = stored.task;
   const meta = getBridgeMeta(task);
   const nowMs = Date.now();
+  // P2-1: never overwrite a committed result. A second complete on an
+  // already-terminal task is rejected with 409, not silently applied.
+  if (isTerminal(task.status.state)) {
+    throw new BridgeError(409, 'already-completed');
+  }
   if (!meta || meta.unclaimed || !meta.claimedBy) {
     throw new BridgeError(409, 'not-claimed');
   }
@@ -902,6 +933,7 @@ export async function completeBridgeTask(
         instruction: meta.instruction,
         submittedAt: meta.submittedAt,
         claimedBy: meta.claimedBy,
+        claimedAt: meta.claimedAt,
         completedAt: nowIso,
       } satisfies BridgeMeta,
     },
