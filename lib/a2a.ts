@@ -277,16 +277,22 @@ class MemoryTaskStore implements TaskStore {
 
 async function createBlobStore(): Promise<TaskStore> {
   // Dynamic import so the module is only loaded when Blob is actually configured.
-  const { put, list } = await import('@vercel/blob');
+  // The store is PRIVATE, so @vercel/blob >= 2.3 private-storage APIs are used:
+  // put(..., { access: 'private' }) and get(pathname, { access: 'private' }).
+  // `access` is per-blob, never inferred from the store — 'public' is rejected
+  // by the API against a private store (that was the production -32603).
+  const { put, list, get } = await import('@vercel/blob');
   const token = process.env.BLOB_READ_WRITE_TOKEN!;
   const PREFIX = 'tasks/';
   const PATH = (id: string) => `${PREFIX}${id}.json`;
 
-  async function readStored(downloadUrl: string): Promise<StoredTask | null> {
+  async function readStored(pathname: string): Promise<StoredTask | null> {
     try {
-      const res = await fetch(downloadUrl, { cache: 'no-store' });
-      if (!res.ok) return null;
-      return (await res.json()) as StoredTask;
+      const res = await get(pathname, { access: 'private', token });
+      // get() returns null on 404; a 304 has no stream.
+      if (!res || !res.stream) return null;
+      const text = await new Response(res.stream as ReadableStream).text();
+      return JSON.parse(text) as StoredTask;
     } catch {
       return null;
     }
@@ -297,9 +303,7 @@ async function createBlobStore(): Promise<TaskStore> {
     async save(t: StoredTask): Promise<void> {
       await put(PATH(t.task.id), JSON.stringify(t), {
         token,
-        // The SDK only accepts 'public' here; the store itself is private, so
-        // blobs are served exclusively via signed download URLs.
-        access: 'public',
+        access: 'private',
         contentType: 'application/json',
         addRandomSuffix: false,
         // Tasks are saved twice (working -> completed) under one pathname.
@@ -307,14 +311,11 @@ async function createBlobStore(): Promise<TaskStore> {
       });
     },
     async get(id: string): Promise<StoredTask | null> {
-      const { blobs } = await list({ token, prefix: PATH(id), limit: 1 });
-      const blob = blobs[0];
-      if (!blob || blob.pathname !== PATH(id)) return null;
-      return readStored(blob.downloadUrl);
+      return readStored(PATH(id));
     },
     async list(limit: number): Promise<StoredTask[]> {
       const seen = new Set<string>();
-      const collected: { uploadedAt: number; downloadUrl: string }[] = [];
+      const collected: { uploadedAt: number; pathname: string }[] = [];
       let cursor: string | undefined;
       do {
         const page = await list({
@@ -328,14 +329,14 @@ async function createBlobStore(): Promise<TaskStore> {
           seen.add(b.pathname);
           collected.push({
             uploadedAt: new Date(b.uploadedAt).getTime(),
-            downloadUrl: b.downloadUrl,
+            pathname: b.pathname,
           });
         }
         cursor = page.hasMore ? page.cursor : undefined;
       } while (cursor && collected.length < 500);
       collected.sort((a, b) => b.uploadedAt - a.uploadedAt);
       const rows = await Promise.all(
-        collected.slice(0, Math.min(limit, 500)).map((c) => readStored(c.downloadUrl)),
+        collected.slice(0, Math.min(limit, 500)).map((c) => readStored(c.pathname)),
       );
       return rows.filter((r): r is StoredTask => r !== null);
     },

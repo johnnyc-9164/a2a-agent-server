@@ -3,7 +3,7 @@
     "next": "^15.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "@vercel/blob": "^1.0.0"
+    "@vercel/blob": "^2.8.0"
   },
   "description": "A2A v1.0 protocol server for the Bot agent card (Next.js App Router, TypeScript)",
   "devDependencies": {
