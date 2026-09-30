@@ -656,6 +656,34 @@ function leaseExpired(meta: BridgeMeta, nowMs: number): boolean {
 }
 
 /**
+ * A lease that may be released: the task is non-terminal, a claim is held,
+ * and the lease is past. Covers claims whose poller died or whose complete
+ * never landed.
+ */
+function leaseReleasable(task: A2ATask, meta: BridgeMeta, nowMs: number): boolean {
+  if (isTerminal(task.status.state)) return false;
+  if (!meta.claimedBy) return false;
+  return leaseExpired(meta, nowMs);
+}
+
+/** Reset a releasable task to SUBMITTED/unclaimed (lazy lease expiry). */
+async function releaseLease(store: TaskStore, task: A2ATask, meta: BridgeMeta): Promise<void> {
+  const released: A2ATask = {
+    ...task,
+    status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() },
+    metadata: {
+      ...task.metadata,
+      bridge: {
+        unclaimed: true,
+        instruction: meta.instruction,
+        submittedAt: meta.submittedAt,
+      } satisfies BridgeMeta,
+    },
+  };
+  await store.save({ task: released, updatedAt: new Date().toISOString() });
+}
+
+/**
  * Create a SUBMITTED runtime task. Persisted EXACTLY like other tasks (so it
  * survives restarts and is visible to GetTask), but NOT executed inline.
  * Returns the persisted SUBMITTED task plus a WORKING copy for the immediate
@@ -715,7 +743,9 @@ export interface BridgePendingTask {
 
 /**
  * Unclaimed SUBMITTED bridge tasks, oldest first. A claimed task whose lease
- * expired is lazily returned to unclaimed here (and on claim reads).
+ * expired is lazily released back to SUBMITTED/unclaimed here (and is
+ * claimable again) — this covers claims whose poller died or whose complete
+ * never landed, regardless of whether the task sits in SUBMITTED or WORKING.
  */
 export async function listBridgePending(): Promise<BridgePendingTask[]> {
   const store = await getStore();
@@ -724,24 +754,13 @@ export async function listBridgePending(): Promise<BridgePendingTask[]> {
   const out: BridgePendingTask[] = [];
   for (const s of rows) {
     const task = s.task;
-    if (task.status.state !== 'TASK_STATE_SUBMITTED') continue;
     const meta = getBridgeMeta(task);
-    if (!meta) continue;
-    if (!meta.unclaimed && !leaseExpired(meta, nowMs)) continue;
-    if (!meta.unclaimed && leaseExpired(meta, nowMs)) {
+    if (!meta || isTerminal(task.status.state)) continue;
+    if (leaseReleasable(task, meta, nowMs)) {
       // Lazy lease expiry: back to unclaimed so the poller can pick it up.
-      const released: A2ATask = {
-        ...task,
-        metadata: {
-          ...task.metadata,
-          bridge: {
-            unclaimed: true,
-            instruction: meta.instruction,
-            submittedAt: meta.submittedAt,
-          } satisfies BridgeMeta,
-        },
-      };
-      await store.save({ task: released, updatedAt: new Date().toISOString() });
+      await releaseLease(store, task, meta);
+    } else if (!(task.status.state === 'TASK_STATE_SUBMITTED' && meta.unclaimed)) {
+      continue;
     }
     out.push({
       id: task.id,
@@ -765,11 +784,14 @@ export async function claimBridgeTask(taskId: string): Promise<A2ATask> {
   if (!stored) throw new BridgeError(404, 'task-not-found');
   const task = stored.task;
   const meta = getBridgeMeta(task);
-  if (task.status.state !== 'TASK_STATE_SUBMITTED' || !meta) {
+  if (!meta || isTerminal(task.status.state)) {
     throw new BridgeError(409, 'already-claimed');
   }
   const nowMs = Date.now();
-  if (!meta.unclaimed && !leaseExpired(meta, nowMs)) {
+  const fresh = task.status.state === 'TASK_STATE_SUBMITTED' && meta.unclaimed;
+  // A releasable (expired-lease) claim is treated as unclaimed: the previous
+  // poller died or its complete never landed.
+  if (!fresh && !leaseReleasable(task, meta, nowMs)) {
     throw new BridgeError(409, 'already-claimed');
   }
   const nowIso = new Date().toISOString();
