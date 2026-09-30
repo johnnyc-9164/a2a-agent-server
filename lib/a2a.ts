@@ -298,7 +298,11 @@ async function createBlobStore(): Promise<TaskStore> {
 
   async function readStored(pathname: string): Promise<StoredTask | null> {
     try {
-      const res = await get(pathname, { access: 'private', token });
+      // useCache:false — the task store does read-after-write (claim ->
+      // complete -> GetTask) and the CDN cache can serve a stale copy for
+      // minutes after an overwrite. Origin reads cost a little more and
+      // guarantee the latest content.
+      const res = await get(pathname, { access: 'private', token, useCache: false });
       // get() returns null on 404; a 304 has no stream.
       if (!res || !res.stream) return null;
       const text = await new Response(res.stream as ReadableStream).text();
