@@ -1,65 +1,41 @@
-# PROGRESS — A2A v1.0 dialect (branch fix/v1-dialect)
+# PROGRESS — A2A bridge v1 (branch feat/bridge, dlg_5b0098f1)
 
-Worktree: ~/workspace/a2a-agent-server-wt/v1dialect
-Spec: ~/workspace/a2a-agent-server/VERIFICATION.md must-fix list (option a: full v1.0 dialect)
+Worktree: ~/workspace/a2a-agent-server-wt/bridge
+Spec: muse-os delegation dlg_5b0098f1 instruction seq 2 (A2A bridge v1 build spec).
 
-## Done
-- [x] M-1: card supportedInterfaces[0].protocolBinding = "JSONRPC"
-- [x] m-1: defaultInputModes/defaultOutputModes = ["text/plain"]
-- [x] c-1: dropped top-level protocolVersion, contact, capabilities.stateTransitionHistory
-- [x] M-2: SendMessage / SendStreamingMessage / GetTask / CancelTask / ListTasks implemented;
-      v0.3 names (message/send, message/stream, tasks/get, tasks/cancel) kept as aliases
-      answering in v1.0 shapes
-- [x] M-4: SendMessage -> {result:{payload:{task}}} ; TASK_STATE_*/ROLE_* enums;
-      kind discriminators on task/message; final status carries the agent message
-- [x] M-3: SSE emits only `data:` lines, each a full {"jsonrpc":"2.0","id":<req>,...} response;
-      no named events, no bare payloads
-- [x] M-6: @vercel/kv replaced by @upstash/redis; UPSTASH_REDIS_REST_URL/_TOKEN;
-      in-memory fallback preserved; .env.example documents the vars
-- [x] emoji scan: 0 hits; no hardcoded prod URLs; typecheck clean; build clean
-- [x] Local dev verification: 33/33 checks PASS (card, SendMessage payload/enums,
-      GetTask+historyLength, CancelTask -32002, aliases, ListTasks, SSE envelope+id match,
-      -32601, -32001)
+## Done (Vercel — Part A)
+- [x] `/run <instruction>` intake: routeCommand routes `/run ` to new `runtime-task`
+      command; executeTask branches BEFORE any skill runs — submitRuntimeTask
+      persists TASK_STATE_SUBMITTED with metadata.bridge={unclaimed:true,
+      instruction, submittedAt} to blob exactly like other tasks; the A2A
+      response carries a WORKING copy (async pattern). Nothing executes inline.
+- [x] Token-gated bridge routes (timing-safe Bearer compare vs BRIDGE_TOKEN;
+      401 {error:'unauthorized'}; never logs token values):
+      - GET /api/bridge/pending -> {tasks:[{id,submittedAt,instructionPreview}]}, oldest first
+      - POST /api/bridge/claim {taskId} -> full claimed task (WORKING, 5-min lease vm-poller), 409 already-claimed
+      - POST /api/bridge/complete {taskId,text,artifacts?,state?} -> COMPLETED (or TASK_STATE_FAILED for refused executions), 409 not-claimed / 410 lease-expired
+      - Expired leases lazily return to unclaimed on pending/claim reads.
+- [x] Agent card gains `runtime-task` skill (read-only v1, refused otherwise).
+- [x] Echo/server-info/task-history paths untouched (server-info lists runtime-task).
+- [x] SendStreamingMessage for /run: emits one WORKING statusUpdate, closes.
+- [x] pnpm run typecheck clean; pnpm run build clean (all routes listed).
 
-## Outstanding (not mine to do here)
-- Production deploy + set UPSTASH_REDIS_REST_URL/_TOKEN on the Vercel project
-  (coordinator/parent step — real credentials never in code/logs)
-- Re-run SDK v1.3.0 client round trip after deploy
+## Done (VM — Part B, ~/workspace/a2a-bridge/)
+- [x] poller.py (stdlib only): 30s loop pending -> claim oldest -> execute -> complete;
+      token from /home/hatch/.config/a2a-bridge/token (0600) in Authorization
+      header only, never logged; logs timestamp/taskId/action/outcome only.
+- [x] Read-only registry: `http-get <url>` (url must start with the prod base
+      URL) and `vercel-read <tool> <json-args>` restricted to
+      list_deployments/get_deployment/list_projects via /opt/hatch/bin/vercel.
+      Anything else -> task FAILED with "refused: instruction not in the v1
+      read-only registry". 60s action timeout, result truncated to 8k.
+- [x] a2a-bridge.service (systemd user unit, Restart=always) + install.sh
+      (daemon-reload/enable/start; falls back to setsid+PID on hosts with no
+      user bus; documents VM-replacement recovery = re-run install.sh).
+- [x] README.md: metric/measure/cadence/kill, auth design, approval preservation.
 
-## dlg_1b06e1d0 — store backend swap: Upstash Redis -> Vercel Blob (2026-09-30)
-- Reason: Vercel Marketplace Redis path has no free tier (paid only). Free private
-  Blob store `a2a-task-store` provisioned on the team; BLOB_READ_WRITE_TOKEN is
-  injected into the Vercel project env (never handled here).
-- lib/a2a.ts: createRedisStore replaced by createBlobStore (@vercel/blob, dynamic
-  import). Tasks stored as tasks/<taskId>.json (put, allowOverwrite, signed
-  downloadUrl reads); get via prefix list; listing via paginated prefix list
-  (cap 500), newest-by-uploadedAt first. TaskStore interface unchanged;
-  in-memory fallback preserved when BLOB_READ_WRITE_TOKEN is absent.
-  kind is now 'memory' | 'blob'.
-- package.json: @upstash/redis removed, @vercel/blob ^1.0.0 added (installed 1.1.1).
-- .env.example: documents BLOB_READ_WRITE_TOKEN, no values.
-- Verified: pnpm typecheck clean, pnpm build clean, local dev SendMessage ->
-  GetTask round trip OK (payload.task, TASK_STATE_COMPLETED, ROLE_* enums,
-  history 2 / artifacts 1), server-info reports store: memory (fallback, no
-  regression). Blob path not live-tested here (no token on this box); correct
-  by construction against @vercel/blob v1.1.1 typings.
-- v1.0 dialect, card, SSE from 2e39b19 untouched (regression-checked via the
-  local round trip above).
-
-## 2026-09-30 ~11:30 CDT — fix/v1-wire-shapes (dlg_9d4c04d8)
-Independent re-verification (real @a2a-js/sdk@1.3.0) found two blocking wire-shape
-defects with one root cause: proto-JSON oneof members serialize FLAT.
-- SendMessage: was {"result":{"payload":{"task"}}} -> now {"result":{"task"}}.
-  (The SDK's SendMessageResponse.fromJSON reads object.task/object.message.)
-- Streaming: was {"kind":"status-update",...} -> now
-  {"result":{"statusUpdate":{taskId,contextId,status}}} and
-  {"result":{"artifactUpdate":{taskId,contextId,artifact,append,lastChunk}}}.
-  Dropped `kind` and `final`; terminal = status.state == TASK_STATE_COMPLETED.
-- Request-side fix found during SDK smoke: the SDK sends parts as {"text":"..."}
-  (flat oneof, no kind). extractText() now accepts both shapes.
-- VERIFICATION.md must-fix list updated with an explicit CORRECTION note.
-- Verified: pnpm typecheck clean, pnpm build clean, real SDK smoke PASS
-  (createFromUrl -> sendMessage TASK_STATE_COMPLETED + correct echo ->
-  getTask -> sendMessageStream 3 events statusUpdate/artifactUpdate/statusUpdate).
-  Legacy message/send alias still answers in flat v1.0 shapes.
-  cancelTask on completed surfaces -32002 through the SDK.
+## To verify after push (production)
+- Deployment READY; card shows runtime-task skill.
+- 401 on unauthenticated/wrong-token bridge calls.
+- SDK submit `/run http-get <card url>` -> poller claims -> COMPLETED with real card JSON.
+- SDK submit `/run <non-registry>` -> FAILED with refusal text.

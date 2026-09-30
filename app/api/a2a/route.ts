@@ -33,7 +33,22 @@ async function handleStream(id: string | number | null, params: SendMessageParam
     async start(controller) {
       const send = (chunk: string) => controller.enqueue(encoder.encode(chunk));
       try {
-        const { working, completed } = await executeTask(params);
+        const { working, completed, async: isAsync } = await executeTask(params);
+        if (isAsync) {
+          // Runtime-task intake: emit the WORKING status once and close.
+          // The real result arrives later via the VM poller and GetTask.
+          send(
+            dataFrame(id, {
+              statusUpdate: {
+                taskId: working.id,
+                contextId: working.contextId,
+                status: working.status,
+              } satisfies TaskStatusUpdateEvent,
+            }),
+          );
+          controller.close();
+          return;
+        }
         // Flat oneof members per the SDK's StreamResponse.fromJSON:
         // result.statusUpdate / result.artifactUpdate. No `kind`, no `final` —
         // the terminal signal is status.state == "TASK_STATE_COMPLETED".
@@ -107,11 +122,14 @@ export async function POST(req: NextRequest) {
       // but always answer in v1.0 shapes.
       case 'SendMessage':
       case 'message/send': {
-        const { completed } = await executeTask((r.params ?? {}) as SendMessageParams);
+        const { working, completed, async: isAsync } = await executeTask(
+          (r.params ?? {}) as SendMessageParams,
+        );
         // Flat oneof member: {"result":{"task":{...}}} — the SDK's
         // SendMessageResponse.fromJSON reads object.task/object.message.
-        // NO `payload` wrapper.
-        return NextResponse.json(rpcResult(id, { task: completed }));
+        // NO `payload` wrapper. Runtime-task intake rides as WORKING here
+        // (async pattern); the persisted row is SUBMITTED for the poller.
+        return NextResponse.json(rpcResult(id, { task: isAsync ? working : completed }));
       }
       case 'SendStreamingMessage':
       case 'message/stream': {

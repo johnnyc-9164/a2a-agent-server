@@ -3,6 +3,9 @@
  * skills, and task execution. JSON-RPC 2.0 transport lives in the API route;
  * this module is transport-agnostic.
  *
+ * Note: runs on the Node.js runtime (routes declare `runtime = 'nodejs'`),
+ * so `node:crypto` timing-safe comparison is used for the bridge token.
+ *
  * v1.0 dialect notes (spec a2a-protocol.org v1.0.0):
  * - Method names: SendMessage, SendStreamingMessage, GetTask, CancelTask, ListTasks
  *   (legacy v0.3 aliases are accepted by the route but respond in v1.0 shapes).
@@ -188,6 +191,13 @@ const CARD_SKILLS: AgentCardSkill[] = [
     tags: ['automation', 'scheduling', 'integrations'],
   },
   {
+    id: 'runtime-task',
+    name: 'Runtime task',
+    description:
+      'Submit a task for real execution by the operator runtime. Prefix message with /run. v1 executes READ-ONLY tasks only; anything else is refused with a failed task and a reason. Results are committed back to the task.',
+    tags: ['runtime', 'execution', 'bridge'],
+  },
+  {
     id: 'writing',
     name: 'Writing and documents',
     description:
@@ -368,6 +378,9 @@ export interface SkillResult {
 export function routeCommand(text: string): { command: string; arg: string } {
   const t = text.trim();
   const lower = t.toLowerCase();
+  // Runtime-task intake: "/run <instruction>" — the task is created SUBMITTED
+  // and picked up later by the authenticated VM poller; never executed inline.
+  if (lower.startsWith('/run ')) return { command: 'runtime-task', arg: t.slice(5).trim() };
   if (lower.startsWith('/echo')) return { command: 'echo', arg: t.slice(5).trim() };
   if (lower.startsWith('echo:')) return { command: 'echo', arg: t.slice(5).trim() };
   if (lower === '/info' || lower === 'info' || lower === 'server-info' || lower === '/server-info')
@@ -394,7 +407,7 @@ export async function runSkill(
           `protocol: A2A 1.0 over JSON-RPC`,
           `store: ${store.kind}`,
           `uptime: ${Math.floor(process.uptime())}s`,
-          `skills: echo, server-info, task-history`,
+          `skills: echo, server-info, task-history, runtime-task (/run)`,
         ].join('\n'),
       };
     }
@@ -458,6 +471,9 @@ export function isTerminal(state: TaskState): boolean {
 export async function executeTask(params: SendMessageParams): Promise<{
   working: A2ATask;
   completed: A2ATask;
+  /** True for runtime-task intake: the returned response should carry
+   *  `working` (async pattern), and `completed` is the persisted SUBMITTED row. */
+  async?: boolean;
 }> {
   const msg = params.message;
   if (!msg || !Array.isArray(msg.parts)) {
@@ -485,6 +501,12 @@ export async function executeTask(params: SendMessageParams): Promise<{
 
   const text = extractText(msg.parts);
   const { command, arg } = routeCommand(text);
+  if (command === 'runtime-task') {
+    // Bridge intake: persist SUBMITTED, return WORKING immediately, execute
+    // NOTHING inline. The VM poller claims and executes this task later.
+    const { submitted, working } = await submitRuntimeTask(params, arg);
+    return { working, completed: submitted, async: true };
+  }
   const result = await runSkill(command, arg, store);
   const agentMessage: A2AMessage = {
     kind: 'message',
@@ -554,4 +576,278 @@ export async function handleListTasks(params: unknown): Promise<A2ATask[]> {
   const store = await getStore();
   const rows = await store.list(limit);
   return rows.map((s) => s.task);
+}
+
+// ---------------------------------------------------------------------------
+// A2A bridge v1 — authenticated VM execution path
+//
+// Flow: an A2A client sends a message starting with `/run <instruction>`;
+// the task is persisted with status SUBMITTED and bridge metadata
+// {unclaimed:true, instruction, submittedAt}. The VM poller (outbound-only,
+// bearer-authenticated) lists pending tasks, claims one (5-min lease),
+// executes it against a READ-ONLY registry, and commits the result back.
+//
+// Auth: every /api/bridge/* route requires
+//   Authorization: Bearer <BRIDGE_TOKEN>
+// compared timing-safe against process.env.BRIDGE_TOKEN. Token values are
+// never logged; on 401 only the path is logged.
+// ---------------------------------------------------------------------------
+
+import { timingSafeEqual } from 'node:crypto';
+
+export interface BridgeMeta {
+  unclaimed?: boolean;
+  instruction?: string;
+  submittedAt?: string;
+  claimedBy?: string;
+  claimedAt?: string;
+  leaseExpiresAt?: string;
+  completedAt?: string;
+}
+
+export const BRIDGE_LEASE_MS = 5 * 60 * 1000;
+
+/** REST error carrying an HTTP status for the bridge routes. */
+export class BridgeError extends Error {
+  status: number;
+  body: { error: string };
+  constructor(status: number, error: string, message?: string) {
+    super(message ?? error);
+    this.status = status;
+    this.body = { error };
+  }
+}
+
+/**
+ * Timing-safe Bearer check. Throws BridgeError(401) on missing/invalid.
+ * Never logs the token or the expected value.
+ */
+export function checkBridgeAuth(req: Request): void {
+  const expected = process.env.BRIDGE_TOKEN;
+  const header = req.headers.get('authorization');
+  if (!expected || !header || !header.startsWith('Bearer ')) {
+    throw new BridgeError(401, 'unauthorized');
+  }
+  const provided = Buffer.from(header.slice(7), 'utf8');
+  const want = Buffer.from(expected, 'utf8');
+  // Lengths are compared in constant time too so a length probe leaks nothing.
+  const a = provided.length === want.length ? provided : want;
+  const b = provided.length === want.length ? want : provided;
+  if (!timingSafeEqual(a, b) || provided.length !== want.length) {
+    throw new BridgeError(401, 'unauthorized');
+  }
+}
+
+/** Read bridge metadata off a task, or undefined when not a bridge task. */
+export function getBridgeMeta(task: A2ATask): BridgeMeta | undefined {
+  const m = task.metadata?.bridge;
+  return typeof m === 'object' && m !== null ? (m as BridgeMeta) : undefined;
+}
+
+function leaseExpired(meta: BridgeMeta, nowMs: number): boolean {
+  if (!meta.leaseExpiresAt) return false;
+  const exp = new Date(meta.leaseExpiresAt).getTime();
+  return Number.isFinite(exp) && exp < nowMs;
+}
+
+/**
+ * Create a SUBMITTED runtime task. Persisted EXACTLY like other tasks (so it
+ * survives restarts and is visible to GetTask), but NOT executed inline.
+ * Returns the persisted SUBMITTED task plus a WORKING copy for the immediate
+ * A2A response (async pattern — the client polls GetTask for the real result).
+ */
+export async function submitRuntimeTask(
+  params: SendMessageParams,
+  instruction: string,
+): Promise<{ submitted: A2ATask; working: A2ATask }> {
+  const msg = params.message;
+  if (!msg || !Array.isArray(msg.parts)) {
+    throw new RpcError(-32602, 'SendMessage requires params.message.parts (array)');
+  }
+  if (!instruction) {
+    throw new RpcError(-32602, '"/run" requires an instruction after it');
+  }
+  const store = await getStore();
+  const taskId = crypto.randomUUID();
+  const contextId = msg.contextId || crypto.randomUUID();
+  const userMessage: A2AMessage = {
+    kind: 'message',
+    messageId: msg.messageId || crypto.randomUUID(),
+    role: 'ROLE_USER',
+    parts: msg.parts,
+    contextId,
+  };
+  const nowIso = () => new Date().toISOString();
+  const submittedAt = nowIso();
+  const submitted: A2ATask = {
+    kind: 'task',
+    id: taskId,
+    contextId,
+    status: { state: 'TASK_STATE_SUBMITTED', timestamp: submittedAt },
+    history: [userMessage],
+    metadata: {
+      bridge: {
+        unclaimed: true,
+        instruction,
+        submittedAt,
+      } satisfies BridgeMeta,
+    },
+  };
+  await store.save({ task: submitted, updatedAt: submittedAt });
+  // Immediate A2A response rides as WORKING; the stored row stays SUBMITTED.
+  const working: A2ATask = {
+    ...submitted,
+    status: { state: 'TASK_STATE_WORKING', timestamp: nowIso() },
+  };
+  return { submitted, working };
+}
+
+export interface BridgePendingTask {
+  id: string;
+  submittedAt: string;
+  instructionPreview: string;
+}
+
+/**
+ * Unclaimed SUBMITTED bridge tasks, oldest first. A claimed task whose lease
+ * expired is lazily returned to unclaimed here (and on claim reads).
+ */
+export async function listBridgePending(): Promise<BridgePendingTask[]> {
+  const store = await getStore();
+  const rows = await store.list(500);
+  const nowMs = Date.now();
+  const out: BridgePendingTask[] = [];
+  for (const s of rows) {
+    const task = s.task;
+    if (task.status.state !== 'TASK_STATE_SUBMITTED') continue;
+    const meta = getBridgeMeta(task);
+    if (!meta) continue;
+    if (!meta.unclaimed && !leaseExpired(meta, nowMs)) continue;
+    if (!meta.unclaimed && leaseExpired(meta, nowMs)) {
+      // Lazy lease expiry: back to unclaimed so the poller can pick it up.
+      const released: A2ATask = {
+        ...task,
+        metadata: {
+          ...task.metadata,
+          bridge: {
+            unclaimed: true,
+            instruction: meta.instruction,
+            submittedAt: meta.submittedAt,
+          } satisfies BridgeMeta,
+        },
+      };
+      await store.save({ task: released, updatedAt: new Date().toISOString() });
+    }
+    out.push({
+      id: task.id,
+      submittedAt: meta.submittedAt ?? '',
+      instructionPreview: (meta.instruction ?? '').slice(0, 120),
+    });
+  }
+  out.sort((a, b) => (a.submittedAt < b.submittedAt ? -1 : a.submittedAt > b.submittedAt ? 1 : 0));
+  return out;
+}
+
+/**
+ * Claim the oldest unclaimed SUBMITTED bridge task. Best-effort atomicity:
+ * read-check-write on the blob store; the single VM poller is the only
+ * claimer in v1, so concurrent claims do not occur in practice. Marks the
+ * task WORKING with a 5-minute lease held by 'vm-poller'.
+ */
+export async function claimBridgeTask(taskId: string): Promise<A2ATask> {
+  const store = await getStore();
+  const stored = await store.get(taskId);
+  if (!stored) throw new BridgeError(404, 'task-not-found');
+  const task = stored.task;
+  const meta = getBridgeMeta(task);
+  if (task.status.state !== 'TASK_STATE_SUBMITTED' || !meta) {
+    throw new BridgeError(409, 'already-claimed');
+  }
+  const nowMs = Date.now();
+  if (!meta.unclaimed && !leaseExpired(meta, nowMs)) {
+    throw new BridgeError(409, 'already-claimed');
+  }
+  const nowIso = new Date().toISOString();
+  const claimed: A2ATask = {
+    ...task,
+    status: { state: 'TASK_STATE_WORKING', timestamp: nowIso },
+    metadata: {
+      ...task.metadata,
+      bridge: {
+        instruction: meta.instruction,
+        submittedAt: meta.submittedAt,
+        claimedBy: 'vm-poller',
+        claimedAt: nowIso,
+        leaseExpiresAt: new Date(nowMs + BRIDGE_LEASE_MS).toISOString(),
+      } satisfies BridgeMeta,
+    },
+  };
+  await store.save({ task: claimed, updatedAt: nowIso });
+  return claimed;
+}
+
+export interface BridgeArtifactInput {
+  artifactId?: string;
+  name?: string;
+  parts?: Array<{ kind?: string; text?: string }>;
+}
+
+/**
+ * Commit a claimed task's result. Verifies the caller still holds a live
+ * lease: unclaimed or unknown lease -> 409; expired lease -> 410 (the task
+ * has been or will be returned to unclaimed, so the result is rejected).
+ * State is COMPLETED by default; the poller may pass 'TASK_STATE_FAILED'
+ * (e.g. a refused non-registry instruction) — terminal states only.
+ */
+export async function completeBridgeTask(
+  taskId: string,
+  text: string,
+  artifacts?: BridgeArtifactInput[],
+  state?: string,
+): Promise<A2ATask> {
+  const terminalState: TaskState =
+    state === 'TASK_STATE_FAILED' ? 'TASK_STATE_FAILED' : 'TASK_STATE_COMPLETED';
+  const store = await getStore();
+  const stored = await store.get(taskId);
+  if (!stored) throw new BridgeError(404, 'task-not-found');
+  const task = stored.task;
+  const meta = getBridgeMeta(task);
+  const nowMs = Date.now();
+  if (!meta || meta.unclaimed || !meta.claimedBy) {
+    throw new BridgeError(409, 'not-claimed');
+  }
+  if (leaseExpired(meta, nowMs)) {
+    throw new BridgeError(410, 'lease-expired');
+  }
+  const nowIso = new Date().toISOString();
+  const agentMessage: A2AMessage = {
+    kind: 'message',
+    messageId: crypto.randomUUID(),
+    role: 'ROLE_AGENT',
+    parts: [{ kind: 'text', text }],
+    contextId: task.contextId,
+  };
+  const normalizedArtifacts: Artifact[] = (artifacts ?? []).map((a) => ({
+    artifactId: a.artifactId || crypto.randomUUID(),
+    name: a.name,
+    parts: (a.parts ?? []).map((p) => ({ kind: 'text' as const, text: String(p.text ?? '') })),
+  }));
+  const history = [...(task.history ?? []), agentMessage];
+  const done: A2ATask = {
+    ...task,
+    status: { state: terminalState, timestamp: nowIso, message: agentMessage },
+    history,
+    artifacts: normalizedArtifacts.length > 0 ? normalizedArtifacts : task.artifacts,
+    metadata: {
+      ...task.metadata,
+      bridge: {
+        instruction: meta.instruction,
+        submittedAt: meta.submittedAt,
+        claimedBy: meta.claimedBy,
+        completedAt: nowIso,
+      } satisfies BridgeMeta,
+    },
+  };
+  await store.save({ task: done, updatedAt: nowIso });
+  return done;
 }
