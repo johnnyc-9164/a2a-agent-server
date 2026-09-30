@@ -199,3 +199,35 @@ https://a2a-agent-server-johnnyc.vercel.app — 9/9 PASS**, plus:
 GitHub → Vercel git deploys confirmed working: push to `master`
 auto-built production deployment `dpl_CSzEVBrDVK2oyH1H1LrQxshSL1dh`
 (READY, commit `1e70d51`).
+
+## Bridge v1 addendum — 2026-09-30 ~12:15 CDT
+
+Commits `d31399f` + `ccaff78` (branch feat/bridge, merged to master,
+pushed as johnnyc-9164): `/run <instruction>` intake creates
+`TASK_STATE_SUBMITTED` bridge tasks (metadata.bridge unclaimed/instruction/
+submittedAt); token-gated `GET /api/bridge/pending`,
+`POST /api/bridge/claim` (5-min lease, 409 on taken),
+`POST /api/bridge/complete` (COMPLETED or TASK_STATE_FAILED, 409/410);
+agent card gains the `runtime-task` skill. Production deployment
+`dpl_7xidL55ueENoyZu3K3vTaHkpALqj` READY (commit `ccaff78`).
+
+Live self-test, real `@a2a-js/sdk@1.3.0` vs production — **5/5 PASS**:
+1. `GET /api/bridge/pending` with no token / wrong token / malformed
+   header -> 401 each (wrong-length token initially 500'd inside
+   `timingSafeEqual`; fixed by padding buffers to equal length first).
+2. `/run http-get <card url>` -> sendMessage answers WORKING immediately
+   (async); VM poller claimed, fetched, committed; GetTask shows
+   TASK_STATE_COMPLETED with the REAL card JSON (6 skills incl.
+   runtime-task, provider.organization johnnyc).
+3. `/run do something consequential` -> poller completed the task
+   TASK_STATE_FAILED with "refused: instruction not in the v1 read-only
+   registry".
+4. `/run vercel-read list_projects {}` -> poller executed the read-only
+   Vercel MCP tool via the official CLI and committed real project data.
+5. `pnpm run typecheck` + `next build` green; card shows runtime-task.
+
+Operational note: Vercel Blob `get()` can serve a stale copy of a
+just-overwritten task for a second or two (claim-then-complete 409'd once;
+GetTask briefly showed WORKING after a 200 complete). The VM poller retries
+complete on 409/410 with backoff (immediate/+3s/+8s); consistent on re-read
+within ~1-2 min. No data loss observed — the retry is the v1 answer.
