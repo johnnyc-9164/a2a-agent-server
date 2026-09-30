@@ -1,23 +1,33 @@
 /**
- * A2A protocol v1.0 — minimal wire types, agent card builder, task store,
- * built-in skills, and task execution. JSON-RPC 2.0 transport lives in the
- * API route; this module is transport-agnostic.
+ * A2A protocol v1.0 — wire types, agent card builder, task store, built-in
+ * skills, and task execution. JSON-RPC 2.0 transport lives in the API route;
+ * this module is transport-agnostic.
+ *
+ * v1.0 dialect notes (spec a2a-protocol.org v1.0.0):
+ * - Method names: SendMessage, SendStreamingMessage, GetTask, CancelTask, ListTasks
+ *   (legacy v0.3 aliases are accepted by the route but respond in v1.0 shapes).
+ * - SendMessage response: { payload: { task } } or { payload: { message } }.
+ * - Enums are ProtoJSON SCREAMING_SNAKE: TASK_STATE_*, ROLE_*.
+ * - Message and Task carry a `kind` discriminator ("message" / "task").
+ * - Streaming events are full JSON-RPC responses per SSE data line.
  */
 
 // ---------------------------------------------------------------------------
-// Wire types (A2A v1.0, minimal but protocol-faithful)
+// Wire types (A2A v1.0)
 // ---------------------------------------------------------------------------
 
 export type TaskState =
-  | 'submitted'
-  | 'working'
-  | 'input-required'
-  | 'completed'
-  | 'canceled'
-  | 'failed'
-  | 'rejected'
-  | 'auth-required'
-  | 'unknown';
+  | 'TASK_STATE_SUBMITTED'
+  | 'TASK_STATE_WORKING'
+  | 'TASK_STATE_INPUT_REQUIRED'
+  | 'TASK_STATE_COMPLETED'
+  | 'TASK_STATE_CANCELED'
+  | 'TASK_STATE_FAILED'
+  | 'TASK_STATE_REJECTED'
+  | 'TASK_STATE_AUTH_REQUIRED'
+  | 'TASK_STATE_UNKNOWN';
+
+export type Role = 'ROLE_USER' | 'ROLE_AGENT';
 
 export interface TextPart {
   kind: 'text';
@@ -34,10 +44,12 @@ export interface DataPart {
 export type Part = TextPart | DataPart;
 
 export interface A2AMessage {
+  kind: 'message';
   messageId: string;
-  role: 'user' | 'agent';
+  role: Role;
   parts: Part[];
   contextId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface TaskStatus {
@@ -51,9 +63,11 @@ export interface Artifact {
   name?: string;
   description?: string;
   parts: Part[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface A2ATask {
+  kind: 'task';
   id: string;
   contextId: string;
   status: TaskStatus;
@@ -61,6 +75,29 @@ export interface A2ATask {
   artifacts?: Artifact[];
   metadata?: Record<string, unknown>;
 }
+
+// ---------------------------------------------------------------------------
+// v1.0 streaming event types (each rides inside a JSON-RPC response on the wire)
+// ---------------------------------------------------------------------------
+
+export interface TaskStatusUpdateEvent {
+  kind: 'status-update';
+  taskId: string;
+  contextId: string;
+  status: TaskStatus;
+  final: boolean;
+}
+
+export interface TaskArtifactUpdateEvent {
+  kind: 'artifact-update';
+  taskId: string;
+  contextId: string;
+  artifact: Artifact;
+  append: boolean;
+  lastChunk: boolean;
+}
+
+export type SendMessageEvent = TaskStatusUpdateEvent | TaskArtifactUpdateEvent;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 envelope
@@ -168,26 +205,21 @@ export function buildAgentCard(requestOrigin?: string) {
     description:
       'Personal AI assistant and builder agent. Handles research, writing, coding, and automation — from deep-dive investigations and data artifacts to shipping Next.js/Vercel web apps. Specializes in production-grade AI agent infrastructure: execution contracts, eval harnesses, and verification layers that keep agents reliable past the demo.',
     version: '1.0.0',
-    protocolVersion: '1.0',
     provider: {
       organization: 'johnnyc',
       url: base,
     },
-    contact: {
-      email: 'foundit@agentmail.to',
-    },
+    // No `authentication` field: this endpoint requires no credentials.
     capabilities: {
       streaming: true,
       pushNotifications: false,
-      stateTransitionHistory: false,
     },
-    defaultInputModes: ['text'],
-    defaultOutputModes: ['text'],
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
     skills: CARD_SKILLS,
-    // No `authentication` field: this endpoint requires no credentials.
     supportedInterfaces: [
       {
-        protocolBinding: 'HTTP+JSON',
+        protocolBinding: 'JSONRPC',
         protocolVersion: '1.0',
         url: `${base}/api/a2a`,
       },
@@ -205,7 +237,7 @@ export interface StoredTask {
 }
 
 export interface TaskStore {
-  kind: 'memory' | 'vercel-kv';
+  kind: 'memory' | 'upstash';
   save(t: StoredTask): Promise<void>;
   get(id: string): Promise<StoredTask | null>;
   list(limit: number): Promise<StoredTask[]>;
@@ -239,23 +271,27 @@ class MemoryTaskStore implements TaskStore {
   }
 }
 
-async function createKvStore(): Promise<TaskStore> {
-  // Dynamic import so the module is only loaded when KV is actually configured.
-  const { kv } = await import('@vercel/kv');
+async function createRedisStore(): Promise<TaskStore> {
+  // Dynamic import so the module is only loaded when Redis is actually configured.
+  const { Redis } = await import('@upstash/redis');
+  const redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL!,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+  });
   const TASK_KEY = (id: string) => `a2a:task:${id}`;
   const INDEX_KEY = 'a2a:task-index';
   return {
-    kind: 'vercel-kv',
+    kind: 'upstash',
     async save(t: StoredTask): Promise<void> {
-      await kv.set(TASK_KEY(t.task.id), t);
-      await kv.lpush(INDEX_KEY, t.task.id);
-      await kv.ltrim(INDEX_KEY, 0, 499);
+      await redis.set(TASK_KEY(t.task.id), t);
+      await redis.lpush(INDEX_KEY, t.task.id);
+      await redis.ltrim(INDEX_KEY, 0, 499);
     },
     async get(id: string): Promise<StoredTask | null> {
-      return (await kv.get<StoredTask>(TASK_KEY(id))) ?? null;
+      return (await redis.get<StoredTask>(TASK_KEY(id))) ?? null;
     },
     async list(limit: number): Promise<StoredTask[]> {
-      const ids = await kv.lrange<string>(INDEX_KEY, 0, limit - 1);
+      const ids = await redis.lrange<string>(INDEX_KEY, 0, limit - 1);
       const seen = new Set<string>();
       const unique = ids
         .filter((id) => {
@@ -265,20 +301,20 @@ async function createKvStore(): Promise<TaskStore> {
         })
         .slice(0, limit);
       if (unique.length === 0) return [];
-      const rows = await kv.mget<StoredTask[]>(...unique.map(TASK_KEY));
+      const rows = await redis.mget<StoredTask[]>(...unique.map(TASK_KEY));
       return rows.filter((r): r is StoredTask => r !== null);
     },
   };
 }
 
-let kvStorePromise: Promise<TaskStore> | null = null;
+let redisStorePromise: Promise<TaskStore> | null = null;
 let memoryStore: MemoryTaskStore | null = null;
 
-/** Vercel KV when configured, in-memory otherwise. */
+/** Upstash Redis when configured, in-memory otherwise. */
 export function getStore(): Promise<TaskStore> {
-  if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
-    if (!kvStorePromise) kvStorePromise = createKvStore();
-    return kvStorePromise;
+  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+    if (!redisStorePromise) redisStorePromise = createRedisStore();
+    return redisStorePromise;
   }
   if (!memoryStore) memoryStore = new MemoryTaskStore();
   return Promise.resolve(memoryStore);
@@ -319,7 +355,7 @@ export async function runSkill(
           `Bot A2A server`,
           `name: ${card.name}`,
           `version: ${card.version}`,
-          `protocol: A2A ${card.protocolVersion} over HTTP+JSON`,
+          `protocol: A2A 1.0 over JSON-RPC`,
           `store: ${store.kind}`,
           `uptime: ${Math.floor(process.uptime())}s`,
           `skills: echo, server-info, task-history`,
@@ -341,7 +377,7 @@ export async function runSkill(
 }
 
 // ---------------------------------------------------------------------------
-// Task execution (shared by message/send and message/stream)
+// Task execution (shared by SendMessage and SendStreamingMessage)
 // ---------------------------------------------------------------------------
 
 export interface SendMessageParams {
@@ -364,7 +400,12 @@ function extractText(parts: Part[] | undefined): string {
     .join('\n');
 }
 
-const TERMINAL_STATES: TaskState[] = ['completed', 'canceled', 'failed', 'rejected'];
+const TERMINAL_STATES: TaskState[] = [
+  'TASK_STATE_COMPLETED',
+  'TASK_STATE_CANCELED',
+  'TASK_STATE_FAILED',
+  'TASK_STATE_REJECTED',
+];
 
 export function isTerminal(state: TaskState): boolean {
   return TERMINAL_STATES.includes(state);
@@ -376,22 +417,24 @@ export async function executeTask(params: SendMessageParams): Promise<{
 }> {
   const msg = params.message;
   if (!msg || !Array.isArray(msg.parts)) {
-    throw new RpcError(-32602, 'message/send requires params.message.parts (array)');
+    throw new RpcError(-32602, 'SendMessage requires params.message.parts (array)');
   }
   const store = await getStore();
   const taskId = crypto.randomUUID();
   const contextId = msg.contextId || crypto.randomUUID();
   const userMessage: A2AMessage = {
+    kind: 'message',
     messageId: msg.messageId || crypto.randomUUID(),
-    role: 'user',
+    role: 'ROLE_USER',
     parts: msg.parts,
     contextId,
   };
   const now = () => new Date().toISOString();
   const working: A2ATask = {
+    kind: 'task',
     id: taskId,
     contextId,
-    status: { state: 'working', timestamp: now() },
+    status: { state: 'TASK_STATE_WORKING', timestamp: now() },
     history: [userMessage],
   };
   await store.save({ task: working, updatedAt: now() });
@@ -400,14 +443,19 @@ export async function executeTask(params: SendMessageParams): Promise<{
   const { command, arg } = routeCommand(text);
   const result = await runSkill(command, arg, store);
   const agentMessage: A2AMessage = {
+    kind: 'message',
     messageId: crypto.randomUUID(),
-    role: 'agent',
+    role: 'ROLE_AGENT',
     parts: [{ kind: 'text', text: result.text }],
     contextId,
   };
   const completed: A2ATask = {
     ...working,
-    status: { state: 'completed', timestamp: now() },
+    status: {
+      state: 'TASK_STATE_COMPLETED',
+      timestamp: now(),
+      message: agentMessage,
+    },
     history: [userMessage, agentMessage],
     artifacts: [
       {
@@ -424,7 +472,7 @@ export async function executeTask(params: SendMessageParams): Promise<{
 export async function handleTasksGet(params: unknown): Promise<A2ATask> {
   const p = (params ?? {}) as { id?: string; historyLength?: number };
   if (typeof p.id !== 'string' || p.id.length === 0) {
-    throw new RpcError(-32602, 'tasks/get requires params.id (string)');
+    throw new RpcError(-32602, 'GetTask requires params.id (string)');
   }
   const store = await getStore();
   const stored = await store.get(p.id);
@@ -439,7 +487,7 @@ export async function handleTasksGet(params: unknown): Promise<A2ATask> {
 export async function handleTasksCancel(params: unknown): Promise<A2ATask> {
   const p = (params ?? {}) as { id?: string };
   if (typeof p.id !== 'string' || p.id.length === 0) {
-    throw new RpcError(-32602, 'tasks/cancel requires params.id (string)');
+    throw new RpcError(-32602, 'CancelTask requires params.id (string)');
   }
   const store = await getStore();
   const stored = await store.get(p.id);
@@ -449,8 +497,17 @@ export async function handleTasksCancel(params: unknown): Promise<A2ATask> {
   }
   const canceled: A2ATask = {
     ...stored.task,
-    status: { state: 'canceled', timestamp: new Date().toISOString() },
+    status: { state: 'TASK_STATE_CANCELED', timestamp: new Date().toISOString() },
   };
   await store.save({ task: canceled, updatedAt: new Date().toISOString() });
   return canceled;
+}
+
+export async function handleListTasks(params: unknown): Promise<A2ATask[]> {
+  const p = (params ?? {}) as { limit?: number };
+  const limit =
+    typeof p.limit === 'number' && p.limit > 0 ? Math.min(Math.floor(p.limit), 100) : 20;
+  const store = await getStore();
+  const rows = await store.list(limit);
+  return rows.map((s) => s.task);
 }
