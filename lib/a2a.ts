@@ -797,6 +797,31 @@ export interface BridgeArtifactInput {
   parts?: Array<{ kind?: string; text?: string }>;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Read the task for a complete call, waiting briefly for the blob read path
+ * to catch up when it looks stale. The blob store can serve a pre-claim copy
+ * for seconds after claim overwrites it (observed ~12s: three consecutive
+ * reads saw SUBMITTED/unclaimed after a 200 claim). If the stored task is a
+ * SUBMITTED bridge task that still looks unclaimed, a claim may be in flight
+ * — re-read until a claim becomes visible or the deadline passes. Any other
+ * shape (missing, terminal, already claimed) returns immediately.
+ */
+async function readForComplete(store: TaskStore, id: string): Promise<StoredTask | null> {
+  const deadline = Date.now() + 20000;
+  for (;;) {
+    const stored = await store.get(id);
+    if (!stored) return null;
+    const meta = getBridgeMeta(stored.task);
+    const maybeStaleClaim =
+      stored.task.status.state === 'TASK_STATE_SUBMITTED' && !!meta && meta.unclaimed;
+    if (!maybeStaleClaim) return stored;
+    if (Date.now() >= deadline) return stored;
+    await sleep(1500);
+  }
+}
+
 /**
  * Commit a claimed task's result. Verifies the caller still holds a live
  * lease: unclaimed or unknown lease -> 409; expired lease -> 410 (the task
@@ -813,7 +838,9 @@ export async function completeBridgeTask(
   const terminalState: TaskState =
     state === 'TASK_STATE_FAILED' ? 'TASK_STATE_FAILED' : 'TASK_STATE_COMPLETED';
   const store = await getStore();
-  const stored = await store.get(taskId);
+  // Wait briefly for the blob read path to catch up when the task looks
+  // like a claim is in flight (see readForComplete).
+  const stored = await readForComplete(store, taskId);
   if (!stored) throw new BridgeError(404, 'task-not-found');
   const task = stored.task;
   const meta = getBridgeMeta(task);
