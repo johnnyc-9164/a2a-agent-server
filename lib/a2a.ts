@@ -630,10 +630,15 @@ export function checkBridgeAuth(req: Request): void {
   }
   const provided = Buffer.from(header.slice(7), 'utf8');
   const want = Buffer.from(expected, 'utf8');
-  // Lengths are compared in constant time too so a length probe leaks nothing.
-  const a = provided.length === want.length ? provided : want;
-  const b = provided.length === want.length ? want : provided;
-  if (!timingSafeEqual(a, b) || provided.length !== want.length) {
+  // Pad both to the same length so timingSafeEqual never throws on a
+  // length mismatch (a throw would surface as a 500, not a 401).
+  const len = Math.max(provided.length, want.length);
+  const a = Buffer.alloc(len);
+  const b = Buffer.alloc(len);
+  provided.copy(a);
+  want.copy(b);
+  const match = provided.length === want.length && timingSafeEqual(a, b);
+  if (!match) {
     throw new BridgeError(401, 'unauthorized');
   }
 }
