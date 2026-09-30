@@ -237,7 +237,7 @@ export interface StoredTask {
 }
 
 export interface TaskStore {
-  kind: 'memory' | 'upstash';
+  kind: 'memory' | 'blob';
   save(t: StoredTask): Promise<void>;
   get(id: string): Promise<StoredTask | null>;
   list(limit: number): Promise<StoredTask[]>;
@@ -271,50 +271,81 @@ class MemoryTaskStore implements TaskStore {
   }
 }
 
-async function createRedisStore(): Promise<TaskStore> {
-  // Dynamic import so the module is only loaded when Redis is actually configured.
-  const { Redis } = await import('@upstash/redis');
-  const redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL!,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-  });
-  const TASK_KEY = (id: string) => `a2a:task:${id}`;
-  const INDEX_KEY = 'a2a:task-index';
+async function createBlobStore(): Promise<TaskStore> {
+  // Dynamic import so the module is only loaded when Blob is actually configured.
+  const { put, list } = await import('@vercel/blob');
+  const token = process.env.BLOB_READ_WRITE_TOKEN!;
+  const PREFIX = 'tasks/';
+  const PATH = (id: string) => `${PREFIX}${id}.json`;
+
+  async function readStored(downloadUrl: string): Promise<StoredTask | null> {
+    try {
+      const res = await fetch(downloadUrl, { cache: 'no-store' });
+      if (!res.ok) return null;
+      return (await res.json()) as StoredTask;
+    } catch {
+      return null;
+    }
+  }
+
   return {
-    kind: 'upstash',
+    kind: 'blob',
     async save(t: StoredTask): Promise<void> {
-      await redis.set(TASK_KEY(t.task.id), t);
-      await redis.lpush(INDEX_KEY, t.task.id);
-      await redis.ltrim(INDEX_KEY, 0, 499);
+      await put(PATH(t.task.id), JSON.stringify(t), {
+        token,
+        // The SDK only accepts 'public' here; the store itself is private, so
+        // blobs are served exclusively via signed download URLs.
+        access: 'public',
+        contentType: 'application/json',
+        addRandomSuffix: false,
+        // Tasks are saved twice (working -> completed) under one pathname.
+        allowOverwrite: true,
+      });
     },
     async get(id: string): Promise<StoredTask | null> {
-      return (await redis.get<StoredTask>(TASK_KEY(id))) ?? null;
+      const { blobs } = await list({ token, prefix: PATH(id), limit: 1 });
+      const blob = blobs[0];
+      if (!blob || blob.pathname !== PATH(id)) return null;
+      return readStored(blob.downloadUrl);
     },
     async list(limit: number): Promise<StoredTask[]> {
-      const ids = await redis.lrange<string>(INDEX_KEY, 0, limit - 1);
       const seen = new Set<string>();
-      const unique = ids
-        .filter((id) => {
-          if (seen.has(id)) return false;
-          seen.add(id);
-          return true;
-        })
-        .slice(0, limit);
-      if (unique.length === 0) return [];
-      const rows = await redis.mget<StoredTask[]>(...unique.map(TASK_KEY));
+      const collected: { uploadedAt: number; downloadUrl: string }[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await list({
+          token,
+          prefix: PREFIX,
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        });
+        for (const b of page.blobs) {
+          if (!b.pathname.startsWith(PREFIX) || seen.has(b.pathname)) continue;
+          seen.add(b.pathname);
+          collected.push({
+            uploadedAt: new Date(b.uploadedAt).getTime(),
+            downloadUrl: b.downloadUrl,
+          });
+        }
+        cursor = page.hasMore ? page.cursor : undefined;
+      } while (cursor && collected.length < 500);
+      collected.sort((a, b) => b.uploadedAt - a.uploadedAt);
+      const rows = await Promise.all(
+        collected.slice(0, Math.min(limit, 500)).map((c) => readStored(c.downloadUrl)),
+      );
       return rows.filter((r): r is StoredTask => r !== null);
     },
   };
 }
 
-let redisStorePromise: Promise<TaskStore> | null = null;
+let blobStorePromise: Promise<TaskStore> | null = null;
 let memoryStore: MemoryTaskStore | null = null;
 
-/** Upstash Redis when configured, in-memory otherwise. */
+/** Vercel Blob when configured, in-memory otherwise. */
 export function getStore(): Promise<TaskStore> {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-    if (!redisStorePromise) redisStorePromise = createRedisStore();
-    return redisStorePromise;
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    if (!blobStorePromise) blobStorePromise = createBlobStore();
+    return blobStorePromise;
   }
   if (!memoryStore) memoryStore = new MemoryTaskStore();
   return Promise.resolve(memoryStore);

@@ -25,3 +25,23 @@ Spec: ~/workspace/a2a-agent-server/VERIFICATION.md must-fix list (option a: full
 - Production deploy + set UPSTASH_REDIS_REST_URL/_TOKEN on the Vercel project
   (coordinator/parent step — real credentials never in code/logs)
 - Re-run SDK v1.3.0 client round trip after deploy
+
+## dlg_1b06e1d0 — store backend swap: Upstash Redis -> Vercel Blob (2026-09-30)
+- Reason: Vercel Marketplace Redis path has no free tier (paid only). Free private
+  Blob store `a2a-task-store` provisioned on the team; BLOB_READ_WRITE_TOKEN is
+  injected into the Vercel project env (never handled here).
+- lib/a2a.ts: createRedisStore replaced by createBlobStore (@vercel/blob, dynamic
+  import). Tasks stored as tasks/<taskId>.json (put, allowOverwrite, signed
+  downloadUrl reads); get via prefix list; listing via paginated prefix list
+  (cap 500), newest-by-uploadedAt first. TaskStore interface unchanged;
+  in-memory fallback preserved when BLOB_READ_WRITE_TOKEN is absent.
+  kind is now 'memory' | 'blob'.
+- package.json: @upstash/redis removed, @vercel/blob ^1.0.0 added (installed 1.1.1).
+- .env.example: documents BLOB_READ_WRITE_TOKEN, no values.
+- Verified: pnpm typecheck clean, pnpm build clean, local dev SendMessage ->
+  GetTask round trip OK (payload.task, TASK_STATE_COMPLETED, ROLE_* enums,
+  history 2 / artifacts 1), server-info reports store: memory (fallback, no
+  regression). Blob path not live-tested here (no token on this box); correct
+  by construction against @vercel/blob v1.1.1 typings.
+- v1.0 dialect, card, SSE from 2e39b19 untouched (regression-checked via the
+  local round trip above).
