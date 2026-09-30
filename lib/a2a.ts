@@ -6,10 +6,15 @@
  * v1.0 dialect notes (spec a2a-protocol.org v1.0.0):
  * - Method names: SendMessage, SendStreamingMessage, GetTask, CancelTask, ListTasks
  *   (legacy v0.3 aliases are accepted by the route but respond in v1.0 shapes).
- * - SendMessage response: { payload: { task } } or { payload: { message } }.
+ * - SendMessage response: { task } or { message } — proto-JSON oneof members
+ *   serialize FLAT (SendMessageResponse.fromJSON reads object.task/object.message);
+ *   there is NO `payload` wrapper. Verified against @a2a-js/sdk@1.3.0.
+ * - Streaming: each SSE data line is a JSON-RPC response whose result carries
+ *   the flat oneof member: { statusUpdate: {...} } / { artifactUpdate: {...} }.
+ *   No `kind` discriminator, no `final` flag — the terminal signal is
+ *   status.state == "TASK_STATE_COMPLETED".
  * - Enums are ProtoJSON SCREAMING_SNAKE: TASK_STATE_*, ROLE_*.
  * - Message and Task carry a `kind` discriminator ("message" / "task").
- * - Streaming events are full JSON-RPC responses per SSE data line.
  */
 
 // ---------------------------------------------------------------------------
@@ -77,19 +82,18 @@ export interface A2ATask {
 }
 
 // ---------------------------------------------------------------------------
-// v1.0 streaming event types (each rides inside a JSON-RPC response on the wire)
+// v1.0 streaming event shapes (each rides inside a JSON-RPC response on the
+// wire as result.statusUpdate / result.artifactUpdate — flat oneof members,
+// no `kind` discriminator, no `final` flag)
 // ---------------------------------------------------------------------------
 
 export interface TaskStatusUpdateEvent {
-  kind: 'status-update';
   taskId: string;
   contextId: string;
   status: TaskStatus;
-  final: boolean;
 }
 
 export interface TaskArtifactUpdateEvent {
-  kind: 'artifact-update';
   taskId: string;
   contextId: string;
   artifact: Artifact;
@@ -425,10 +429,18 @@ export interface SendMessageParams {
 
 function extractText(parts: Part[] | undefined): string {
   if (!Array.isArray(parts)) return '';
-  return parts
-    .filter((p): p is TextPart => p.kind === 'text' && typeof (p as TextPart).text === 'string')
-    .map((p) => p.text)
-    .join('\n');
+  const out: string[] = [];
+  for (const p of parts) {
+    if (typeof p !== 'object' || p === null) continue;
+    const part = p as { kind?: unknown; text?: unknown };
+    // Accept both the TS convenience shape { kind: 'text', text } and the
+    // canonical proto-JSON oneof member { text: '...' } that the official
+    // SDK actually sends on the wire (no `kind` discriminator).
+    if (typeof part.text === 'string' && (part.kind === undefined || part.kind === 'text')) {
+      out.push(part.text);
+    }
+  }
+  return out.join('\n');
 }
 
 const TERMINAL_STATES: TaskState[] = [

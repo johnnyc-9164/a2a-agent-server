@@ -45,3 +45,21 @@ Spec: ~/workspace/a2a-agent-server/VERIFICATION.md must-fix list (option a: full
   by construction against @vercel/blob v1.1.1 typings.
 - v1.0 dialect, card, SSE from 2e39b19 untouched (regression-checked via the
   local round trip above).
+
+## 2026-09-30 ~11:30 CDT — fix/v1-wire-shapes (dlg_9d4c04d8)
+Independent re-verification (real @a2a-js/sdk@1.3.0) found two blocking wire-shape
+defects with one root cause: proto-JSON oneof members serialize FLAT.
+- SendMessage: was {"result":{"payload":{"task"}}} -> now {"result":{"task"}}.
+  (The SDK's SendMessageResponse.fromJSON reads object.task/object.message.)
+- Streaming: was {"kind":"status-update",...} -> now
+  {"result":{"statusUpdate":{taskId,contextId,status}}} and
+  {"result":{"artifactUpdate":{taskId,contextId,artifact,append,lastChunk}}}.
+  Dropped `kind` and `final`; terminal = status.state == TASK_STATE_COMPLETED.
+- Request-side fix found during SDK smoke: the SDK sends parts as {"text":"..."}
+  (flat oneof, no kind). extractText() now accepts both shapes.
+- VERIFICATION.md must-fix list updated with an explicit CORRECTION note.
+- Verified: pnpm typecheck clean, pnpm build clean, real SDK smoke PASS
+  (createFromUrl -> sendMessage TASK_STATE_COMPLETED + correct echo ->
+  getTask -> sendMessageStream 3 events statusUpdate/artifactUpdate/statusUpdate).
+  Legacy message/send alias still answers in flat v1.0 shapes.
+  cancelTask on completed surfaces -32002 through the SDK.

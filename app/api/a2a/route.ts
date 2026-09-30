@@ -2,8 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import {
   JsonRpcRequest,
   RpcError,
-  SendMessageEvent,
   SendMessageParams,
+  TaskArtifactUpdateEvent,
+  TaskStatusUpdateEvent,
   executeTask,
   handleListTasks,
   handleTasksCancel,
@@ -16,7 +17,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /** One SSE frame: every `data:` line is a complete JSON-RPC 2.0 response
- *  whose `id` matches the request — no bare payloads, no named events. */
+ *  whose `id` matches the request — no bare payloads, no named events.
+ *  The result carries the flat oneof member: { statusUpdate } / { artifactUpdate }. */
 function dataFrame(id: string | number | null, result: unknown): string {
   return `data: ${JSON.stringify(rpcResult(id, result))}\n\n`;
 }
@@ -32,33 +34,40 @@ async function handleStream(id: string | number | null, params: SendMessageParam
       const send = (chunk: string) => controller.enqueue(encoder.encode(chunk));
       try {
         const { working, completed } = await executeTask(params);
-        const statusEvent: SendMessageEvent = {
-          kind: 'status-update',
-          taskId: working.id,
-          contextId: working.contextId,
-          status: working.status,
-          final: false,
-        };
-        send(dataFrame(id, statusEvent));
+        // Flat oneof members per the SDK's StreamResponse.fromJSON:
+        // result.statusUpdate / result.artifactUpdate. No `kind`, no `final` —
+        // the terminal signal is status.state == "TASK_STATE_COMPLETED".
+        send(
+          dataFrame(id, {
+            statusUpdate: {
+              taskId: working.id,
+              contextId: working.contextId,
+              status: working.status,
+            } satisfies TaskStatusUpdateEvent,
+          }),
+        );
         for (const artifact of completed.artifacts ?? []) {
-          const artifactEvent: SendMessageEvent = {
-            kind: 'artifact-update',
-            taskId: completed.id,
-            contextId: completed.contextId,
-            artifact,
-            append: false,
-            lastChunk: true,
-          };
-          send(dataFrame(id, artifactEvent));
+          send(
+            dataFrame(id, {
+              artifactUpdate: {
+                taskId: completed.id,
+                contextId: completed.contextId,
+                artifact,
+                append: false,
+                lastChunk: true,
+              } satisfies TaskArtifactUpdateEvent,
+            }),
+          );
         }
-        const finalEvent: SendMessageEvent = {
-          kind: 'status-update',
-          taskId: completed.id,
-          contextId: completed.contextId,
-          status: completed.status,
-          final: true,
-        };
-        send(dataFrame(id, finalEvent));
+        send(
+          dataFrame(id, {
+            statusUpdate: {
+              taskId: completed.id,
+              contextId: completed.contextId,
+              status: completed.status,
+            } satisfies TaskStatusUpdateEvent,
+          }),
+        );
       } catch (err) {
         if (err instanceof RpcError) {
           send(errorFrame(id, err));
@@ -99,7 +108,10 @@ export async function POST(req: NextRequest) {
       case 'SendMessage':
       case 'message/send': {
         const { completed } = await executeTask((r.params ?? {}) as SendMessageParams);
-        return NextResponse.json(rpcResult(id, { payload: { task: completed } }));
+        // Flat oneof member: {"result":{"task":{...}}} — the SDK's
+        // SendMessageResponse.fromJSON reads object.task/object.message.
+        // NO `payload` wrapper.
+        return NextResponse.json(rpcResult(id, { task: completed }));
       }
       case 'SendStreamingMessage':
       case 'message/stream': {

@@ -118,17 +118,36 @@ ephemeral tasks.
 
 ## Must-fix list
 
+> **CORRECTION 2026-09-30 (independent re-verification, real @a2a-js/sdk@1.3.0):**
+> the original M-4 text above was wrong about the response wrapper. The SDK's
+> *generated* `SendMessageResponse.fromJSON` is the authority, not the spec prose:
+> proto-JSON oneof members serialize **FLAT**. `{"result":{"payload":{"task":{…}}}}`
+> throws `Invalid response: missing payload`; the correct wire shape is
+> `{"result":{"task":{…}}}` (and `{"result":{"message":{…}}}` for message
+> responses). Same root cause in streaming: the SDK's `StreamResponse.fromJSON`
+> reads `object.statusUpdate` / `object.artifactUpdate` FLAT — the `kind`
+> discriminator (`status-update`/`artifact-update`) matches nothing and every event
+> parsed as `{}`. Correct: `{"result":{"statusUpdate":{taskId,contextId,status}}}`
+> and `{"result":{"artifactUpdate":{taskId,contextId,artifact,append,lastChunk}}}`,
+> still full JSON-RPC envelopes on every SSE `data:` line with the matching request
+> id. Also drop the `final` field — v1.0 `TaskStatusUpdateEvent` has no `final`;
+> the terminal signal is `status.state == "TASK_STATE_COMPLETED"`.
+> (Fixed in `fix/v1-wire-shapes`.)
+
 1. **(M-1)** `lib/a2a.ts` → `buildAgentCard()`: change
    `supportedInterfaces[0].protocolBinding` from `"HTTP+JSON"` to `"JSONRPC"`.
    The endpoint consumes/produces JSON-RPC 2.0 envelopes — that is the JSONRPC binding.
 2. **(M-2/M-3/M-4 — pick one)** Either
    **(a)** implement the v1.0 dialect in `app/api/a2a/route.ts` + `lib/a2a.ts`
    (`SendMessage`/`SendStreamingMessage`/`GetTask`/`CancelTask`/`ListTasks`,
-   `SendMessageResponse` `{task|message}` payload wrapper, `TASK_STATE_*`/`ROLE_*`
-   enums, per-event JSON-RPC SSE envelopes with matching `id`), keeping the card's
-   `"1.0"` claim; **or (b)** honestly advertise the 0.3 dialect
-   (`protocolVersion: "0.3"`, binding `"JSONRPC"`) so SDK clients with
-   `legacyCompat: {enabled:true}` can connect. (a) is the real fix; (b) is a stopgap.
+   flat oneof members `{"result":{"task":{…}}}` / `{"result":{"message":{…}}}`,
+   `TASK_STATE_*`/`ROLE_*` enums, per-event JSON-RPC SSE envelopes with matching
+   `id` carrying flat `result.statusUpdate` / `result.artifactUpdate`, no `kind`,
+   no `final`), keeping the card's `"1.0"` claim; **or (b)** honestly advertise
+   the 0.3 dialect (`protocolVersion: "0.3"`, binding `"JSONRPC"`) so SDK clients
+   with `legacyCompat: {enabled:true}` can connect. (a) is the real fix;
+   (b) is a stopgap. **See the CORRECTION above — the original `{payload:{…}}`
+   wrapper in this item was wrong.**
 3. **(M-6)** Set `KV_REST_API_URL` + `KV_REST_API_TOKEN` on the Vercel project
    `a2a-agent-server`, or document that tasks are ephemeral per instance.
 4. **(m-1)** `lib/a2a.ts` → `buildAgentCard()`: `defaultInputModes`/`defaultOutputModes`
